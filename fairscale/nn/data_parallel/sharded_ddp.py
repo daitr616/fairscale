@@ -50,9 +50,7 @@ class ShardedDataParallel(nn.Module):
             Synchronize the models in between the ranks when starting up. Not needed if each rank has the same seed,
             or the training restarts from a saved state
         reduce_buffer_size (int):
-            The max size of the buffer used to batch the small parameter tensors, in number of elements (default 8M).
-            this will impact the long term memory consumption, because these buckets correspond to parameters which will not be sharded.
-            Set to 0 to remove all bucketing.
+            Deprecated. Used to be the maximal buffer size used to pack gradients in the reduce phase.
         auto_refresh_trainable (bool):
             Check whether the parameters trainability (`requires_grad`) has changed
 
@@ -95,7 +93,7 @@ class ShardedDataParallel(nn.Module):
         process_group: Any = None,
         broadcast_buffers: bool = True,
         sync_models_at_startup: bool = True,
-        reduce_buffer_size: int = 2 ** 23,
+        reduce_buffer_size: int = -1,
         auto_refresh_trainable: bool = True,
     ):
         super().__init__()
@@ -111,7 +109,8 @@ class ShardedDataParallel(nn.Module):
 
         # Communication related attributes
         self.process_group = process_group if process_group is not None else dist.group.WORLD
-        self.world_size_scaling = 1.0 / dist.get_world_size(self.process_group)  # > 0
+        self.world_size = dist.get_world_size(self.process_group)
+        self.world_size_scaling = 1.0 / self.world_size  # > 0
         self.reference_global_rank = OSS.get_global_rank(self.process_group, 0)  # picking rank 0 as the reference
         self.rank = dist.get_rank(self.process_group)
         self.global_rank = OSS.get_global_rank(self.process_group, self.rank)
@@ -130,9 +129,6 @@ class ShardedDataParallel(nn.Module):
         ).format(distinct_device_types)
         self.device_type = list(distinct_device_types)[0]
 
-        # Scafolding to be able to reduce the grads during the BW pass
-        # several optimizers can be present each working on seperate parameter set which is spread across multiple ranks
-
         # - we build an iterator which goes through all the parameters involved globally
         self._all_params = list(
             chain(
@@ -142,6 +138,7 @@ class ShardedDataParallel(nn.Module):
         self._trainable_params: List[torch.Tensor] = []
         self._grad_to_be_reduced: List[bool] = []
         self._trainable_param_to_rank: Dict[torch.Tensor, int] = {}
+        self._per_rank_trainable_params: Dict[torch.device, List[List[torch.Tensor]]] = {}  # device, rank, params
         self._reference_trainable_mask = list(map(_trainable, self._all_params))
 
         # - keep track of the grads which have already been reduced
@@ -149,19 +146,6 @@ class ShardedDataParallel(nn.Module):
         self._reduced_grads_max = 0
 
         # - setup buckets and tensor views
-        model_size = sum([p.numel() for p in self.module.parameters()])
-        if dist.get_world_size(self.process_group) <= 8:
-            logging.info("Assuming single node environment. De-activating ShardedDDP buckets")
-            reduce_buffer_size = 0
-
-        self.buffer_max_size = min(reduce_buffer_size, model_size)
-        logging.info(
-            "ShardedDDP bucket size: {:.2f}M parameters, model size {:.2f}M parameters".format(
-                self.buffer_max_size / 2 ** 20, model_size / 2 ** 20
-            )
-        )
-        self.use_buckets = self.buffer_max_size > 0
-
         self.buckets: Dict[torch.device, List[Bucket]] = {}
         self._should_bucket_grad: List[bool] = []
         self._bucket_list: Optional[List[Bucket]] = None
@@ -194,6 +178,10 @@ class ShardedDataParallel(nn.Module):
 
                 self.refresh_trainable()
                 self._reference_trainable_mask = trainable_mask
+
+        # DEBUG
+        self._setup_buckets()
+        self._setup_backward_hooks()
 
         if self.enable_broadcast_buffers:
             # NCCL communications are on a different stream, needs to be blocking
@@ -251,19 +239,25 @@ class ShardedDataParallel(nn.Module):
         self._grad_to_be_reduced = [True for _ in self._trainable_params]
 
         self._trainable_param_to_rank = {}
+        self._per_rank_trainable_params = {}
         for optim in self.sharded_optimizers:
             # OSS may need to change the communication pattern
             optim.refresh_trainable()
 
             # Update ShardedDDP given the new partitions
             for (
-                device_per_rank_params
-            ) in optim.per_device_params.values():  # all the params on this device (inc all ranks)
-                for device_params in device_per_rank_params:
-                    for param in filter(lambda x: x.requires_grad, device_params):
-                        self._trainable_param_to_rank[param] = optim.param_to_rank[param]
+                device,
+                per_rank_params,
+            ) in optim.per_device_params.items():  # all the params on this device (inc all ranks)
+                if device not in self._per_rank_trainable_params.keys():
+                    self._per_rank_trainable_params[device] = [[] for _ in range(self.world_size)]
 
-        self._setup_bucket_strategy()
+                for rank, device_params in enumerate(per_rank_params):
+                    for param in filter(lambda x: x.requires_grad, device_params):
+                        self._trainable_param_to_rank[param] = rank
+                        self._per_rank_trainable_params[device][rank].append(param)
+
+        self._setup_buckets()
         self._setup_backward_hooks()
 
     def reduce(self) -> None:
@@ -331,16 +325,15 @@ class ShardedDataParallel(nn.Module):
             self._grad_to_be_reduced = [True for _ in self._grad_to_be_reduced]
             self._reduced_grads = 0
 
-            if self.use_buckets:
-                assert self._bucket_list is not None
+            assert self._bucket_list is not None
 
-                for bucket in self._bucket_list:
-                    assert bucket.sent, (
-                        "A bucket failed to be sent, probably unused parameters."
-                        + "Either remove the unused parameter or de-activate ShardedDDP buckets -set reduce_buffer_size to 0-"
-                    )
+            for bucket in self._bucket_list:
+                assert bucket.sent, (
+                    "A bucket failed to be sent, probably unused parameters. "
+                    + "Either remove the unused parameter or de-activate ShardedDDP buckets -set reduce_buffer_size to 0-"
+                )
 
-                    bucket.reset()
+                bucket.reset()
 
     def _find_rank(self, param: Parameter) -> Tuple[OSS, int]:
         """ Look up where this parameter belongs to """
@@ -359,80 +352,45 @@ class ShardedDataParallel(nn.Module):
         Either way a delayed action is necessary and is passed as a callback.
         """
 
-        if not self.use_buckets or not self._should_bucket_grad[index]:
-            # Direct reduction
-            @torch.no_grad()
-            def reduce(*_: Any) -> None:
-                # Skip gradient reduction, do not alter status flags
-                if not self.should_accumulate_grads and self._grad_to_be_reduced[index]:
-                    assert param.grad is not None, "Reducing gradients during backward pass, cannot be None"
+        @torch.no_grad()
+        def reduce(*_: Any) -> None:
+            # Skip gradient reduction, do not alter status flags
+            if not self.should_accumulate_grads and self._grad_to_be_reduced[index]:
+                assert param.grad is not None, "Reducing gradients during backward pass, cannot be None"
 
-                    # Make sure that this is not fired twice
-                    self._grad_to_be_reduced[index] = False
-                    param.grad.mul_(self.world_size_scaling)
+                # Make sure that this is not fired twice
+                self._grad_to_be_reduced[index] = False
+                bucket = self.buckets[param.device][dst_rank]
+                bucket.params_checked_in += 1
 
-                    # Future work includes clearing up the buffer if possible
-                    def cleanup() -> None:
-                        if dst_rank != self.global_rank:
-                            param.grad = None
+                if bucket.full():
+                    # Normalize the bucket in one go
+                    bucket.buffer.mul_(self.world_size_scaling)
 
-                    # Async reduce for this buffer, log the future
+                    def wipe_bucket() -> None:
+                        bucket.buffer.resize_(0)
+
+                    # Reduce the bucket
+                    bucket.sent = True
+
                     self._work_handles.append(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=param.grad.data, dst=dst_rank, group=self.process_group, async_op=True
+                                tensor=bucket.buffer, dst=bucket.destination, group=self.process_group, async_op=True,
                             ),
-                            callback=cleanup,
+                            callback=None if self.rank == dst_rank else wipe_bucket,
                         )
                     )
                     self._reduced_grads += 1
 
-                    # Opportunistically try to empty the queue
-                    self._try_consume_work_handle()
+                # Opportunistically try to empty the queue
+                self._try_consume_work_handle()
 
-                    # If all the reduce operations have been called,
-                    # make sure that all the asynchronous calls have concluded before moving on
-                    # and execute the delayed actions (release gradients, unroll the buckets)
-                    if self._reduced_grads == self._reduced_grads_max:
-                        self._consume_work_handles()
-
-        else:
-
-            @torch.no_grad()
-            def reduce(*_: Any) -> None:
-                # Skip gradient reduction, do not alter status flags
-                if not self.should_accumulate_grads and self._grad_to_be_reduced[index]:
-                    assert param.grad is not None, "Reducing gradients during backward pass, cannot be None"
-
-                    # Make sure that this is not fired twice
-                    self._grad_to_be_reduced[index] = False
-                    bucket = self.buckets[param.device][dst_rank]
-                    bucket.params_checked_in += 1
-
-                    if bucket.full():
-                        # Normalize the bucket in one go
-                        bucket.buffer.mul_(self.world_size_scaling)
-
-                        # Reduce the bucket
-                        bucket.sent = True
-                        self._work_handles.append(
-                            Workhandle(
-                                handle=dist.reduce(
-                                    tensor=bucket.buffer, dst=dst_rank, group=self.process_group, async_op=True,
-                                ),
-                                callback=None,
-                            )
-                        )
-                        self._reduced_grads += 1
-
-                    # Opportunistically try to empty the queue
-                    self._try_consume_work_handle()
-
-                    # If all the reduce operations have been called,
-                    # make sure that all the asynchronous calls have concluded before moving on
-                    # and execute the delayed actions (release gradients, unroll the buckets)
-                    if self._reduced_grads == self._reduced_grads_max:
-                        self._consume_work_handles()
+                # If all the reduce operations have been called,
+                # make sure that all the asynchronous calls have concluded before moving on
+                # and execute the delayed actions (release gradients, unroll the buckets)
+                if self._reduced_grads == self._reduced_grads_max:
+                    self._consume_work_handles()
 
         return reduce
 
@@ -459,26 +417,24 @@ class ShardedDataParallel(nn.Module):
             self._grad_accs.append(grad_acc)  # keep this function in scope
 
         #  Add a hook on the module to flush the buckets, if needed
-        if self.use_buckets:
+        def bucket_flush(*_: Any) -> None:
+            assert self._bucket_list is not None
+            handle = None
 
-            def bucket_flush(*_: Any) -> None:
-                assert self._bucket_list is not None
-                handle = None
+            for bucket in self._bucket_list:
+                if not bucket.sent:
+                    # Reduce the bucket. Some parameters went unused and this bucket was not flushed
+                    bucket.buffer.mul_(self.world_size_scaling)
+                    bucket.sent = True
+                    handle = dist.reduce(
+                        tensor=bucket.buffer, dst=bucket.destination, group=self.process_group, async_op=True,
+                    )
 
-                for bucket in self._bucket_list:
-                    if not bucket.sent:
-                        # Reduce the bucket. Some parameters went unused and this bucket was not flushed
-                        bucket.buffer.mul_(self.world_size_scaling)
-                        bucket.sent = True
-                        handle = dist.reduce(
-                            tensor=bucket.buffer, dst=bucket.destination, group=self.process_group, async_op=True,
-                        )
+            # Only wait on the last handle
+            if handle:
+                handle.wait()
 
-                # Only wait on the last handle
-                if handle:
-                    handle.wait()
-
-            self.module.register_backward_hook(bucket_flush)
+        self.module.register_backward_hook(bucket_flush)
 
     @torch.no_grad()
     def _sync_params_and_buffers(self) -> None:
@@ -509,66 +465,37 @@ class ShardedDataParallel(nn.Module):
                 # SyncBatchNorm only supports DDP with single-process single-device anyway'
                 layer._specify_ddp_gpu_num(1)  # type: ignore
 
-    def _setup_bucket_strategy(self) -> None:
+    def _setup_buckets(self) -> None:
         """Devise a bucketing strategy on a per-rank ownership level.
         These buckets will not be sharded, since the gradients would be re-allocated during the backward in that case.
         This method can be a slow for big models, but it it not typically called often (not for every forward for instance)
         """
 
-        # A priori, one reduce call per param
-        self._reduced_grads_max = len(self._trainable_params)
+        # FIXME: Do not always wipe the buckets, reuse the one already there ?
+        self._reduced_grads_max = 0
 
-        if not self.use_buckets:
-            return
+        for device, per_rank_params in self._per_rank_trainable_params.items():
+            self.buckets[device] = []
 
-        # Devise the bucketing strategy. Parameters are already sorted, in that:
-        # - these are only the trainable parameters, so they should produce grads
-        # - they are sorted by increasing size
-        self.buckets = {}
+            for rank, params in enumerate(per_rank_params):
+                trainable_params = list(filter(_trainable, params))
+                bucket_size = sum(map(lambda x: x.numel(), trainable_params))
+                dst_rank = OSS.get_global_rank(self.process_group, rank)
 
-        for param in self._trainable_params:
-            device = param.device
-            dst_rank = self._trainable_param_to_rank[param]
+                bucket = Bucket(buffer=torch.zeros(bucket_size, dtype=params[0].dtype, device=device))
+                bucket.destination = dst_rank
 
-            if param.device not in self.buckets.keys():
-                self.buckets[param.device] = [
-                    Bucket(buffer=torch.zeros(self.buffer_max_size, dtype=param.dtype, device=device))
-                    for _ in range(dist.get_world_size(self.process_group))
-                ]
+                for param in params:
+                    # This parameter gradients becomes a view of the bucket
+                    fill_next = bucket.fill + param.numel()
+                    param.grad = bucket.buffer[bucket.fill : fill_next].view_as(param.data)
+                    bucket.fill = fill_next
+                    bucket.max_params_checked_in += 1
 
-            bucket = self.buckets[device][dst_rank]
-            bucket.destination = dst_rank
-
-            # Criteria to decide whether this parameter is to be bucketed or not:
-            # - enough room in the bucket
-            if (bucket.fill + param.numel()) < self.buffer_max_size:
-                self._should_bucket_grad.append(True)
-
-                # This parameter gradients becomes a view of the bucket
-                fill_next = bucket.fill + param.numel()
-
-                if param.grad is None:
-                    # will be overwritten just below, see next line
-                    param.grad = torch.zeros_like(param)
-
-                param.grad.data = bucket.buffer[bucket.fill : fill_next].view_as(param.data)
-                bucket.fill = fill_next
-
-                # Update the bucket
-                self._reduced_grads_max -= 1  # one less reduce call per bucketed grad
-                self.buckets[device][dst_rank].max_params_checked_in += 1
-
-            else:
-                self._should_bucket_grad.append(False)
+                self.buckets[device].append(bucket)
+                self._reduced_grads_max += 1
 
         self._bucket_list = list(chain(*[self.buckets[device] for device in self.buckets.keys()]))
-
-        # Resize the buckets to remove lost space in the end
-        for bucket in self._bucket_list:
-            bucket.buffer.resize_(bucket.fill)
-            bucket.sent = True
-            if bucket.max_params_checked_in > 0:
-                self._reduced_grads_max += 1  # one reduce call per bucket
 
     def _consume_work_handles(self) -> None:
         """Consume all the futures which are tied to this optimizer's buckets.
